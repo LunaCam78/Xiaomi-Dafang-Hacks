@@ -59,3 +59,9 @@ firmware_mod/config/lighttpd.user
 firmware_mod/config/lighttpd.pem
 firmware_mod/config/userscripts/*/*
 firmware_mod/root/.ssh/*
+
+*.conf
+
+firmware_original/Linux_kernel_3.10_Wyze_Cam_v2_and_Pan/
+
+firmware_original/

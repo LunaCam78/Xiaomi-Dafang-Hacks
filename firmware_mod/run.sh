@@ -97,6 +97,24 @@ EOF
 fi
 /system/sdcard/bin/busybox crond -L /system/sdcard/log/crond.log -c /system/sdcard/config/cron/crontabs
 
+##-- setup audio drivers and notifications --##
+## Load audio driver module:
+echo "starting audio drivers... " >> $LOGPATH
+insmod /system/sdcard/driver/audio.ko4
+## set audio files to use as notifications
+if [ ! -f /system/sdcard/media/borg ]; then
+  borgmesh_audio=true
+  echo "the borg have invaded our system..." >> $LOGPATH
+  default_audio_notif=/system/sdcard/media/borg_hail.wav
+  echo "$default_audio_notif as default notification sound" >> $LOGPATH
+fi
+
+## start up audio
+if [ $borgmesh_audio==true ]; then
+  sample-Audio $default_audio_notif
+fi
+## error notification
+
 ## Set Hostname
 if [ ! -f $CONFIGPATH/hostname.conf ]; then
   cp $CONFIGPATH/hostname.conf.dist $CONFIGPATH/hostname.conf
@@ -133,6 +151,31 @@ else
   network_interface_name="wlan0"
 fi
 
+## Configure network address
+if [ -f "$CONFIGPATH/staticip.conf" ]; then
+  # Install a resolv.conf if present so DNS can work
+  if [ -f "$CONFIGPATH/resolv.conf" ]; then
+    cp "$CONFIGPATH/resolv.conf" /etc/resolv.conf
+  fi
+
+  # Configure staticip/netmask from config/staticip.conf
+  staticip_and_netmask=$(cat "$CONFIGPATH/staticip.conf" | grep -v "^$" | grep -v "^#")
+  ifconfig "$network_interface_name" $staticip_and_netmask
+  ifconfig "$network_interface_name" up
+  # Configure default gateway
+  if [ -f "$CONFIGPATH/defaultgw.conf" ]; then
+    defaultgw=$(cat "$CONFIGPATH/defaultgw.conf" | grep -v "^$" | grep -v "^#")
+    route add default gw $defaultgw $network_interface_name
+    echo "Configured $defaultgw as default gateway" >> $LOGPATH
+  fi
+  echo "Configured $network_interface_name with static address $staticip_and_netmask" >> $LOGPATH
+else
+  # Configure with DHCP client
+  ifconfig "$network_interface_name" up
+  udhcpc_status=$(udhcpc -i "$network_interface_name" -p /var/run/udhcpc.pid -b -x hostname:"$(hostname)")
+  echo "udhcpc: $udhcpc_status" >> $LOGPATH
+fi
+
 ## Enable mesh network, if configured
 if [ -f  "$CONFIGPATH/batman-adv.conf" ]; then
   source "$CONFIGPATH/batman-adv.conf"
@@ -161,31 +204,6 @@ if [ -f  "$CONFIGPATH/batman-adv.conf" ]; then
   fi
 fi
 
-## Configure network address
-if [ -f "$CONFIGPATH/staticip.conf" ]; then
-  # Install a resolv.conf if present so DNS can work
-  if [ -f "$CONFIGPATH/resolv.conf" ]; then
-    cp "$CONFIGPATH/resolv.conf" /etc/resolv.conf
-  fi
-
-  # Configure staticip/netmask from config/staticip.conf
-  staticip_and_netmask=$(cat "$CONFIGPATH/staticip.conf" | grep -v "^$" | grep -v "^#")
-  ifconfig "$network_interface_name" $staticip_and_netmask
-  ifconfig "$network_interface_name" up
-  # Configure default gateway
-  if [ -f "$CONFIGPATH/defaultgw.conf" ]; then
-    defaultgw=$(cat "$CONFIGPATH/defaultgw.conf" | grep -v "^$" | grep -v "^#")
-    route add default gw $defaultgw $network_interface_name
-    echo "Configured $defaultgw as default gateway" >> $LOGPATH
-  fi
-  echo "Configured $network_interface_name with static address $staticip_and_netmask" >> $LOGPATH
-else
-  # Configure with DHCP client
-  ifconfig "$network_interface_name" up
-  udhcpc_status=$(udhcpc -i "$network_interface_name" -p /var/run/udhcpc.pid -b -x hostname:"$(hostname)")
-  echo "udhcpc: $udhcpc_status" >> $LOGPATH
-fi
-
 ## Set Timezone
 set_timezone
 
@@ -196,9 +214,6 @@ fi
 ntp_srv="$(cat "$CONFIGPATH/ntp_srv.conf")"
 timeout -t 30 sh -c "until ping -c1 \"$ntp_srv\" &>/dev/null; do sleep 3; done";
 /system/sdcard/bin/busybox ntpd -p "$ntp_srv"
-
-## Load audio driver module:
-insmod /system/sdcard/driver/audio.ko
 
 ## Initialize the GPIOS:
 for pin in 25 26 38 39 49; do

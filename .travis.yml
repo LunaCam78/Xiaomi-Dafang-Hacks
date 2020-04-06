@@ -1,0 +1,10 @@
+language: shell
+dist: trusty
+
+os:
+  - linux
+
+
+script:
+  - shellcheck --version
+  - for file in $(grep -IRl "#\!\(/usr/bin/env \|/bin/\)sh" --exclude-dir "var" --exclude "*.txt"); do shellcheck --format=gcc --shell=sh $file; done;

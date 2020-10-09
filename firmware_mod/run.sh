@@ -108,6 +108,24 @@ EOF
 fi
 /system/sdcard/bin/busybox crond -L /system/sdcard/log/crond.log -c /system/sdcard/config/cron/crontabs
 
+##-- setup audio drivers and notifications --##
+## Load audio driver module:
+echo "starting audio drivers... " >> $LOGPATH
+insmod /system/sdcard/driver/audio.ko4
+## set audio files to use as notifications
+if [ ! -f /system/sdcard/media/borg ]; then
+  borgmesh_audio=true
+  echo "the borg have invaded our system..." >> $LOGPATH
+  default_audio_notif=/system/sdcard/media/borg_hail.wav
+  echo "$default_audio_notif as default notification sound" >> $LOGPATH
+fi
+
+## start up audio
+if [ $borgmesh_audio==true ]; then
+  sample-Audio $default_audio_notif
+fi
+## error notification
+
 ## Set Hostname
 if [ ! -f $CONFIGPATH/hostname.conf ]; then
   cp $CONFIGPATH/hostname.conf.dist $CONFIGPATH/hostname.conf
@@ -169,6 +187,34 @@ else
   echo "udhcpc: $udhcpc_status" >> $LOGPATH
 fi
 
+## Enable mesh network, if configured
+if [ -f  "$CONFIGPATH/batman-adv.conf" ]; then
+  source "$CONFIGPATH/batman-adv.conf"
+
+  if [ "$bat_mesh_enable" == "true" ]; then
+    # XXX Load dependencies not part of the stock kernel image
+    insmod /system/sdcard/driver/crc16.ko
+    insmod /system/sdcard/driver/libcrc32c.ko
+
+    # Load batman module
+    insmod /system/sdcard/driver/batman-adv.ko
+
+    # Create and configure mesh interface
+    /system/sdcard/bin/busybox ip link add name bat0 type batadv
+    if [ -n "$bat_mesh_orig_interval" ]; then
+      echo "$bat_mesh_orig_interval" > /sys/class/net/bat0/mesh/orig_interval
+    fi
+
+    # Increase mtu of real NIC 1500->1532 to accommodate batman header
+    ifconfig "$network_interface_name" mtu 1532
+
+    # Slave the real NIC to mesh
+    /system/sdcard/bin/busybox ip link set dev "$network_interface_name" master bat0
+
+    network_interface_name="bat0"
+  fi
+fi
+
 ## Set Timezone
 set_timezone
 
@@ -179,9 +225,6 @@ fi
 ntp_srv="$(cat "$CONFIGPATH/ntp_srv.conf")"
 timeout -t 30 sh -c "until ping -c1 \"$ntp_srv\" &>/dev/null; do sleep 3; done";
 /system/sdcard/bin/busybox ntpd -p "$ntp_srv"
-
-## Load audio driver module:
-insmod /system/sdcard/driver/audio.ko
 
 ## Initialize the GPIOS:
 for pin in 25 26 38 39 49; do

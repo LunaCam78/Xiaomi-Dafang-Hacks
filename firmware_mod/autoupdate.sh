@@ -18,11 +18,15 @@ DESTOVERRIDE="/tmp/Update"
 EXCLUDEFILTER="*.conf|*.user|passwd|shadow"
 GITHUBURL="https://api.github.com/repos"
 GITHUBURLRAW="https://raw.githubusercontent.com"
-CURL="/system/sdcard/bin/curl -k"
+CURL="/system/sdcard/bin/curl -k -L"
 JQ="/system/sdcard/bin/jq"
 SHA="/system/sdcard/bin/openssl dgst -sha256"
 BASENAME="/system/sdcard/bin/busybox basename"
 FIND="/system/sdcard/bin/busybox find"
+VERSION_FILE='/system/sdcard/VERSION'
+COMMITS_FILE='/tmp/.lastcommit'
+
+
 
 TMPFILE=/tmp/update.tmp
 BACKUPEXT=.backup
@@ -41,9 +45,11 @@ usage()
 {
     echo "Usage: $1 [OPTIONS]"
     echo "$1 will update a local folder with the ${REPO} github repo (first copy all the files in ${DESTOVERRIDE}, stop services and reboot"
-    echo "Usage this script to update the ${REPO} github repo from ${BRANCH} branch"
+    echo "Usage this script to update the ${REPO} github repo from ${BRANCH} (default) branch"
     echo "Options:"
     echo "-b (--backup) backup erased file (add extension ${BACKUPEXT} to the local file before ovewrite it) "
+    echo "-x (--repo) to set the repo"
+    echo "-r (--branch) to set the branch"
     echo "-f (--force) force update"
     echo "-d (--dest) set the destination folder (default is ${DESTFOLDER})"
     echo "-p (--print) print action only, do nothing"
@@ -51,6 +57,7 @@ usage()
 
     echo "-v (--verbose) for verbose"
     echo "-u (--user) githup login/password (not mandatory, but sometime anonymous account get banned)"
+    echo "-t (--token) github API token"
     echo "-h (--help) for this help"
     echo
     echo "Note that ${EXCLUDEFILTER} will be excluded"
@@ -124,13 +131,6 @@ ismatch()
 
     echo notmatch
 }
-##########################################################################
-# Return the current (last) commit from the specified repo and branch
-getCurrentCommitDateFromRemote()
-{
-    LASTCOMMITDATE=$(${CURL} -s ${GITHUBURL}/${REPO}/commits/${BRANCH} | grep date | head -1 | cut -d'"' -f 4)
-    echo ${LASTCOMMITDATE}
-}
 
 ##########################################################################
 # Print the files from repo of the folder $1
@@ -148,7 +148,7 @@ getfiles()
 
         for row in $(echo "${1}" | ${JQ} '.[]| select(.type == "dir") | .path' ); do
             flder=$(echo "${row}" | tr -d '"')
-            next=$(${CURL} -s https://api.github.com/repos/${REPO}/contents/${flder}?ref=${BRANCH})
+            next=$(curl -s https://api.github.com/repos/${REPO}/contents/${flder}?ref=${BRANCH})
             getfiles "${next}"
         done
     fi
@@ -165,6 +165,24 @@ countdownreboot()
         sleep 1;
     done
     action reboot
+}
+##########################################################################
+# Generate VERSION file
+generateVersionFile ()
+{
+    echo "{\"date\":\"${REMOTECOMMITDATE}\",\"repo\":\"${REPO}\",\"branch\":\"${BRANCH}\",\"commit\":\"${REMOTECOMMITID}\"}" > $VERSION_FILE
+}
+##########################################################################
+# Curl with optional authentication
+curl ()
+{
+    if [ -n "$_TOKEN" ]; then
+      $CURL -H "Authorization: token $_TOKEN" "$@"
+    elif [ -n "$_USER" ]; then
+      $CURL -u "$_USER" "$@"
+    else
+      $CURL "$@"
+    fi
 }
 ##########################################################################
 # Script real start
@@ -198,13 +216,28 @@ do
             shift
             ;;
         -u | --user)
-            CURL="${CURL} -u $2"
+            _USER="$2"
+            shift
+            shift
+            ;;
+        -t | --token)
+            _TOKEN="$2"
             shift
             shift
             ;;
         -s | --steps)
             _PROGRESS=1;
            shift
+           ;;
+        -x | --repo)
+            REPO=$2;
+            shift
+            shift
+            ;;
+        -r | --branch)
+	    BRANCH=$2
+	    shift
+            shift
            ;;
         *|-h |\? | --help)
             usage $0
@@ -213,7 +246,13 @@ do
     esac
 done
 
-log "Starting AutoUpdate"
+log "Starting AutoUpdate on branch ${BRANCH}"
+
+######################################################""
+# Get date and last commit ID from Github
+curl -s ${GITHUBURL}/${REPO}/commits/${BRANCH} --output $COMMITS_FILE
+REMOTECOMMITDATE=$(${JQ} -r '.commit .author .date' ${COMMITS_FILE})
+REMOTECOMMITID=$(${JQ} -r '.sha[0:7]' ${COMMITS_FILE} )
 
 if [ ${_FORCE} = 1 ]; then
     log "Forcing update."
@@ -229,11 +268,30 @@ fi
 
 action "rm -rf ${DESTOVERRIDE} 2>/dev/null"
 
-
-
-log "Getting list of remote files."
-FIRST=$(${CURL} -s ${GITHUBURL}/${REPO}/contents/${REMOTEFOLDER}?ref=${BRANCH})
-FILES=$(getfiles "${FIRST}")
+if [ -f "$VERSION_FILE" ]; then
+    LOCALCOMMITID=$(${JQ} -r .commit ${VERSION_FILE})
+    LOCALREPO=$(${JQ} -r .repo ${VERSION_FILE})
+    if [ -z "$LOCALREPO" ]; then LOCALREPO="$REPO"; fi
+    if [ ${LOCALREPO} = ${REPO} ] && [ ${LOCALCOMMITID} = ${REMOTECOMMITID} ]; then
+        logerror "You are currently on the latest version"
+        echo "You are currently on the latest version"
+        exit 1
+    elif [ ${LOCALREPO} = ${REPO} ]; then
+        echo "Need to upgrade from ${LOCALCOMMITID} to ${REMOTECOMMITID}"
+        log "Getting list of remote files."
+        FILES=$(curl -s ${GITHUBURL}/${REPO}/compare/${LOCALCOMMITID}...${REMOTECOMMITID} | ${JQ} -r '.files[].raw_url' | grep ${REMOTEFOLDER})
+    else
+        echo "Repo has changed. Upgrade to last commit ${REMOTECOMMITID}"
+        log "Getting list of remote files."
+        FIRST=$(curl -s ${GITHUBURL}/${REPO}/contents/${REMOTEFOLDER}?ref=${BRANCH})
+        FILES=$(getfiles "${FIRST}")
+    fi
+else
+    echo "Version file missing. Upgrade to last commit ${REMOTECOMMITID}"
+    log "Getting list of remote files."
+    FIRST=$(curl -s ${GITHUBURL}/${REPO}/contents/${REMOTEFOLDER}?ref=${BRANCH})
+    FILES=$(getfiles "${FIRST}")
+fi
 
 if [ $_PROGRESS = 1 ]; then
    _NBTOTALFILES=$(echo $FILES | wc -w)
@@ -246,8 +304,7 @@ for i in ${FILES}
 do
     progress
     # String to remove to get the local path
-    REMOVE="${GITHUBURLRAW}/${REPO}/${BRANCH}/${REMOTEFOLDER}/"
-    LOCALFILE="${i#$REMOVE}"
+    LOCALFILE=$(echo ${i} | awk -F ${REMOTEFOLDER}/ '{print $2}')
     # Remove files that match the filter
     res=$(ismatch ${LOCALFILE})
     if [ "$res" == "match" ]; then
@@ -255,17 +312,17 @@ do
         continue
     fi
     # Get the file temporally to calculate SHA
-    ${CURL} -s ${i} -o ${TMPFILE} 2>/dev/null
+    curl -s ${i} -o ${TMPFILE} 2>/dev/null
     if [ ! -f ${TMPFILE} ]; then
         echo "Can not get remote file $i, exiting."
         exit 1
     fi
     # sometimes zero byte files are received, which overwrite the local files, we ignore those files
     # exception: files that are hidden i.e. start with dot. Ex: files like ".gitkeep"
-    if [[ ! -s ${TMPFILE} ]] && [[ $(basename ${LOCALFILE} | cut -c1-1) != "." ]]; then                
-        echo "Received zero byte file $i, exiting."                                                    
-        exit 1                                                                                         
-    fi         
+    if [[ ! -s ${TMPFILE} ]] && [[ $(basename ${LOCALFILE} | cut -c1-1) != "." ]]; then
+        echo "Received zero byte file $i, exiting."
+        exit 1
+    fi
     # Check the file exists in local
     if [ -f "${DESTFOLDER}/${LOCALFILE}" ]; then
         REMOTESHA=$(${SHA} ${TMPFILE} 2>/dev/null | cut -d "=" -f 2)
@@ -345,7 +402,7 @@ if [ -d ${DESTOVERRIDE} ] && [ $(ls -l ${DESTOVERRIDE}/* | wc -l 2>/dev/null) > 
     action "rm -Rf ${DESTOVERRIDE}/* 2>/dev/null"
 
     # Everythings was OK, save the date
-    echo $(getCurrentCommitDateFromRemote) > /system/sdcard/.lastCommitDate
+    generateVersionFile
     echo "---------------    Reboot    ------------"
     if [ ${_FORCEREBOOT} = 1 ]; then
         countdownreboot
@@ -358,6 +415,6 @@ if [ -d ${DESTOVERRIDE} ] && [ $(ls -l ${DESTOVERRIDE}/* | wc -l 2>/dev/null) > 
         fi
     fi
 else
-    echo $(getCurrentCommitDateFromRemote) > /system/sdcard/.lastCommitDate
+    generateVersionFile
     echo "No files to update."
 fi

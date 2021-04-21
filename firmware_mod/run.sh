@@ -55,13 +55,16 @@ echo "Bind mounted /system/sdcard/root to /root" >> $LOGPATH
 mount -o bind /system/sdcard/etc /etc
 echo "Bind mounted /system/sdcard/etc to /etc" >> $LOGPATH
 
-## Create a swap file on SD if desired
-## please view the swap.conf.dist file for more infomation
+## Create busybox aliases
+if [ ! -f ~/.busybox_aliases ]; then
+  /system/sdcard/bin/busybox --list | sed "s/^\(.*\)$/alias \1='busybox \1'/" > ~/.busybox_aliases
+fi
+
 if [ -f "$CONFIGPATH/swap.conf" ]; then
   . $CONFIGPATH/swap.conf
-else
-  SWAP=false
 fi
+
+## Create a swap file on SD if desired
 if [ "$SWAP" = true ]; then
   if [ ! -f $SWAPPATH ]; then
     echo "Creating ${SWAPSIZE}MB swap file on SD card"  >> $LOGPATH
@@ -70,8 +73,16 @@ if [ "$SWAP" = true ]; then
     echo "Swap file created in $SWAPPATH" >> $LOGPATH
   fi
   echo "Configuring swap file" >> $LOGPATH
-  swapon $SWAPPATH
+  swapon -p 10 $SWAPPATH
   echo "Swap set on file $SWAPPATH" >> $LOGPATH
+fi
+
+# Create ZRAM swap as on the original firmware
+if [ ! "$SWAP_ZRAM" = false ]; then
+    echo 100 > /proc/sys/vm/swappiness
+    echo $SWAP_ZRAM_SIZE > /sys/block/zram0/disksize
+    mkswap /dev/zram0
+    swapon -p 20 /dev/zram0
 fi
 
 ## Create crontab dir and start crond:
@@ -128,13 +139,18 @@ if [ -f $CONFIGPATH/usb_eth_driver.conf ]; then
   insmod /system/sdcard/driver/usbnet.ko
   insmod /system/sdcard/driver/asix.ko
 
-  network_interface_name="eth0"
+  ## Configure network address
+  if [ -f "$CONFIGPATH/staticip.conf" ]; then
+    configure_static_net_iface eth0 >> $LOGPATH
+  else
+    # Configure with DHCP client
+    ifconfig eth0 up
+    udhcpc_status=$(udhcpc -i eth0 -p /var/run/udhcpc.eth0.pid -b -x hostname:"$(hostname)")
+    echo "udhcpc: $udhcpc_status" >> $LOGPATH
+  fi
 else
   ## Start Wifi:
-  if [ ! -f $CONFIGPATH/wpa_supplicant.conf ]; then
-  echo "Warning: You have to configure wpa_supplicant in order to use wifi. Please see /system/sdcard/config/wpa_supplicant.conf.dist for further instructions."
-  fi
-  MAC=$(grep MAC < /params/config/.product_config | cut -c16-27 | sed 's/\(..\)/\1:/g;s/:$//')
+  MAC=$(get_wifi_mac)
   if [ -f /driver/8189es.ko ]; then
     # Its a DaFang
     insmod /driver/8189es.ko rtw_initmac="$MAC"
@@ -145,35 +161,7 @@ else
     # Its a Wyzecam V2
     insmod /driver/rtl8189ftv.ko rtw_initmac="$MAC"
   fi
-  wpa_supplicant_status="$(wpa_supplicant -d -B -i wlan0 -c $CONFIGPATH/wpa_supplicant.conf -P /var/run/wpa_supplicant.pid)"
-  echo "wpa_supplicant: $wpa_supplicant_status" >> $LOGPATH
-
-  network_interface_name="wlan0"
-fi
-
-## Configure network address
-if [ -f "$CONFIGPATH/staticip.conf" ]; then
-  # Install a resolv.conf if present so DNS can work
-  if [ -f "$CONFIGPATH/resolv.conf" ]; then
-    cp "$CONFIGPATH/resolv.conf" /etc/resolv.conf
-  fi
-
-  # Configure staticip/netmask from config/staticip.conf
-  staticip_and_netmask=$(cat "$CONFIGPATH/staticip.conf" | grep -v "^$" | grep -v "^#")
-  ifconfig "$network_interface_name" $staticip_and_netmask
-  ifconfig "$network_interface_name" up
-  # Configure default gateway
-  if [ -f "$CONFIGPATH/defaultgw.conf" ]; then
-    defaultgw=$(cat "$CONFIGPATH/defaultgw.conf" | grep -v "^$" | grep -v "^#")
-    route add default gw $defaultgw $network_interface_name
-    echo "Configured $defaultgw as default gateway" >> $LOGPATH
-  fi
-  echo "Configured $network_interface_name with static address $staticip_and_netmask" >> $LOGPATH
-else
-  # Configure with DHCP client
-  ifconfig "$network_interface_name" up
-  udhcpc_status=$(udhcpc -i "$network_interface_name" -p /var/run/udhcpc.pid -b -x hostname:"$(hostname)")
-  echo "udhcpc: $udhcpc_status" >> $LOGPATH
+  /system/sdcard/scripts/wifi.sh start >> $LOGPATH
 fi
 
 ## Enable mesh network, if configured
@@ -212,7 +200,7 @@ if [ ! -f $CONFIGPATH/ntp_srv.conf ]; then
   cp $CONFIGPATH/ntp_srv.conf.dist $CONFIGPATH/ntp_srv.conf
 fi
 ntp_srv="$(cat "$CONFIGPATH/ntp_srv.conf")"
-timeout -t 30 sh -c "until ping -c1 \"$ntp_srv\" &>/dev/null; do sleep 3; done";
+timeout 30 sh -c "until ping -c1 \"$ntp_srv\" &>/dev/null; do sleep 3; done";
 /system/sdcard/bin/busybox ntpd -p "$ntp_srv"
 
 ## Initialize the GPIOS:
@@ -225,10 +213,11 @@ echo 1 > /sys/class/gpio/gpio49/active_low
 echo "Initialized gpios" >> $LOGPATH
 
 ## Set leds to default startup states:
+## LED's off by default to inscrease camera stealth
 ir_led off
 ir_cut on
 yellow_led off
-blue_led on
+blue_led off
 
 ## Load motor driver module:
 insmod /driver/sample_motor.ko
@@ -251,28 +240,14 @@ else
   insmod /system/sdcard/driver/sensor_jxf23.ko data_interface=2 pwdn_gpio=-1 reset_gpio=18 sensor_gpio_func=0
 fi
 
-## Start SSH Server:
-dropbear_status=$(/system/sdcard/bin/dropbearmulti dropbear -R)
-echo "dropbear: $dropbear_status" >> $LOGPATH
-
-## Create a certificate for the webserver
-if [ ! -f $CONFIGPATH/lighttpd.pem ]; then
-  export OPENSSL_CONF=$CONFIGPATH/openssl.cnf
-  /system/sdcard/bin/openssl req -new -x509 -keyout $CONFIGPATH/lighttpd.pem -out $CONFIGPATH/lighttpd.pem -days 365 -nodes -subj "/C=DE/ST=Bavaria/L=Munich/O=.../OU=.../CN=.../emailAddress=..."
-  chmod 400 $CONFIGPATH/lighttpd.pem
-  echo "Created new certificate for webserver" >> $LOGPATH
-fi
-
-## Start Webserver:
-if [ ! -f $CONFIGPATH/lighttpd.conf ]; then
-  cp $CONFIGPATH/lighttpd.conf.dist $CONFIGPATH/lighttpd.conf
-fi
-lighttpd_status=$(/system/sdcard/bin/lighttpd -f /system/sdcard/config/lighttpd.conf)
-echo "lighttpd: $lighttpd_status" >> $LOGPATH
-
 ## Copy autonight configuration:
 if [ ! -f $CONFIGPATH/autonight.conf ]; then
   cp $CONFIGPATH/autonight.conf.dist $CONFIGPATH/autonight.conf
+fi
+
+## Copy onvif camera ptz configuration:
+if [ ! -f $CONFIGPATH/ptz_presets.conf ]; then
+  cp $CONFIGPATH/ptz_presets.conf.dist $CONFIGPATH/ptz_presets.conf
 fi
 
 ## Configure OSD:
@@ -291,8 +266,9 @@ for i in /system/sdcard/config/autostart/*; do
 done
 
 ## Autostart startup userscripts
-for i in /system/sdcard/config/userscripts/startup/*; do
-  $i &
-done
+/bin/find /system/sdcard/config/userscripts/startup/ -executable -name "*.sh" -exec {} \;
 
 echo "Startup finished!" >> $LOGPATH
+echo "" >> $LOGPATH
+echo "Contents of dmesg after startup:" >> $LOGPATH
+dmesg >> $LOGPATH
